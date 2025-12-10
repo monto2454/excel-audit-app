@@ -1,23 +1,15 @@
-import unicodedata
+import math
 from io import BytesIO
-
-from flask import (
-    Flask,
-    render_template,
-    request,
-    send_file,
-    session,
-    redirect,
-    url_for,
-)
+from flask import Flask, render_template, request, send_file
 import pandas as pd
+import openpyxl
 
 app = Flask(__name__)
-# Needed for using session (for error report storage)
-app.secret_key = "change-this-to-a-random-secret-key"
+app.config["LAST_ERRORS"] = []
+app.config["LAST_FILENAME"] = None
 
 
-# ---------- Helper: convert 0-based column index → Excel letters ----------
+# ----------------- Helper: Excel column index -> letter -----------------
 def col_index_to_letter(idx_zero_based: int) -> str:
     idx = idx_zero_based + 1  # convert to 1-based
     letters = []
@@ -27,192 +19,253 @@ def col_index_to_letter(idx_zero_based: int) -> str:
     return "".join(reversed(letters))
 
 
-# ---------- Core validation function ----------
-def validate_dataframe(df: pd.DataFrame):
+# ----------------- Full-stop rule (Rule 8) -----------------
+def has_full_stop_issue(text: str) -> bool:
+    """
+    Rule 8: A full stop (.) is an issue ONLY when it appears at the END of the value.
+    """
+    stripped = text.rstrip()
+    return stripped.endswith(".")
+
+
+# ----------------- Title-case rule (Rule 9 – non-Breadcrumb columns only) -----------------
+def is_title_case_issue(text: str) -> bool:
+    """
+    Applies ONLY when:
+      - cell has 2 or more words
+      - column is NOT Breadcrumbs
+
+    Rules:
+      - First word must start uppercase
+      - All other words must start lowercase
+      - Hyphens remain part of a word
+    """
+    stripped = text.strip()
+    words = stripped.split()
+
+    if len(words) < 2:
+        return False
+
+    def first_alpha_char(word: str):
+        for ch in word:
+            if ch.isalpha():
+                return ch
+        return None
+
+    # First word must start uppercase
+    first = words[0]
+    first_ch = first_alpha_char(first)
+    if first_ch is not None and not first_ch.isupper():
+        return True
+
+    # Remaining words must start lowercase
+    for w in words[1:]:
+        ch = first_alpha_char(w)
+        if ch is None:
+            continue
+        if ch.isupper():
+            return True
+
+    return False
+
+
+# ----------------- Core validation logic (all 12 rules) -----------------
+def validate_audit_sheet(df: pd.DataFrame):
     errors = []
+    summary = {
+        "Trailing spaces": 0,
+        "Double spaces": 0,
+        "Colons": 0,
+        "Spaces after (": 0,
+        "Spaces before )": 0,
+        "Spaces around -": 0,
+        "Unbalanced brackets": 0,
+        "Full stop issues": 0,
+        "Title case issues": 0,
+        "Accents / non-ASCII": 0,
+        "Breadcrumb ends with >": 0,
+        "Duplicate breadcrumbs": 0,
+    }
 
-    # --------------------------------------------
-    # Breadcrumb column is ALWAYS column R
-    # R (1-based) -> index 17 (0-based: A=0, ..., R=17)
-    # --------------------------------------------
-    breadcrumb_col_index = 17  # Column R
-    breadcrumb_col_name = df.columns[breadcrumb_col_index]
+    # Detect Breadcrumbs column (case-insensitive)
+    breadcrumb_col_name = None
+    for col in df.columns:
+        if str(col).strip().lower() == "breadcrumbs":
+            breadcrumb_col_name = col
+            break
 
-    # Track duplicate breadcrumbs using normalized values
-    breadcrumb_seen = {}
+    breadcrumb_seen = {}  # value -> first cell reference
 
-    # Loop through every cell in the file
-    for row_idx, (_, row) in enumerate(df.iterrows()):
+    for row_idx, row in df.iterrows():
         for col_idx, col_name in enumerate(df.columns):
-
             value = row[col_name]
+            text = "" if pd.isna(value) else str(value)
 
-            # Normalize empty/missing values
-            if pd.isna(value):
-                text = ""
-            else:
-                text = str(value)
-
-            if text == "":
+            if text.strip() == "":
                 continue
 
-            stripped = text.strip()
-            col_letter = col_index_to_letter(col_idx)
-            row_number = row_idx + 2  # first data row = Excel row 2
-            cell_address = f"{col_letter}{row_number}"
+            clean_text = text.strip()
+            cell_address = f"{col_index_to_letter(col_idx)}{row_idx + 2}"
+            issues = []
 
-            # 1) Trailing spaces
-            if text != text.rstrip(" "):
-                errors.append((cell_address, "Trailing space at end of value"))
+            # ------------------ Breadcrumb column (Only Rule 11 + Rule 12) ------------------
+            if breadcrumb_col_name is not None and col_name == breadcrumb_col_name:
+                norm = clean_text
 
-            # 2) Double spaces between words
-            if "  " in text:
-                errors.append((cell_address, "Multiple spaces between words"))
-
-            # 4) Colon
-            if ":" in text:
-                errors.append((cell_address, "Contains colon ':'"))
-
-            # 6) Space after (
-            if "( " in text:
-                errors.append((cell_address, "Space after '('"))
-
-            # 7) Space before )
-            if " )" in text:
-                errors.append((cell_address, "Space before ')'"))
-
-            # 8) Space around hyphen
-            if " -" in text or "- " in text:
-                errors.append((cell_address, "Space before or after '-'"))
-
-            # 9) Unbalanced parentheses
-            if text.count("(") != text.count(")"):
-                errors.append((cell_address, "Unbalanced parentheses '(' and ')'"))
-
-            # 10) Full-stop
-            if "." in text:
-                errors.append((cell_address, "Contains full-stop '.'"))
-
-            # 11) Title Case detection (2+ words, each capitalized, not ALL CAPS)
-            words = stripped.split()
-            if len(words) >= 2:
-                is_title_case = all(
-                    w[0].isalpha()
-                    and w[0].isupper()
-                    and w[1:].islower()
-                    for w in words
-                    if w.isalpha()
-                )
-                if is_title_case and not stripped.isupper():
-                    errors.append((cell_address, "Text appears to be in Title Case"))
-
-            # 12) Accents / non-ASCII characters
-            has_accent = False
-            for ch in text:
-                if ord(ch) > 127:
-                    has_accent = True
-                    break
-                decomp = unicodedata.normalize("NFD", ch)
-                if any(unicodedata.category(c) == "Mn" for c in decomp):
-                    has_accent = True
-                    break
-            if has_accent:
-                errors.append(
-                    (cell_address, "Contains accented or non-ASCII characters")
-                )
-
-            # ---------- Breadcrumb-only rules ----------
-            if col_idx == breadcrumb_col_index:  # ONLY column R
-                display_value = stripped
-
-                # Normalize for duplicate detection
-                normalized_key = " ".join(stripped.split()).lower()
-
-                # 3) Duplicate breadcrumb
-                if normalized_key:
-                    if normalized_key in breadcrumb_seen:
-                        first_cell = breadcrumb_seen[normalized_key]
-                        msg = (
-                            f"Duplicate breadcrumb '{display_value}' "
-                            f"(first seen at {first_cell})"
-                        )
-                        errors.append((cell_address, msg))
+                # Rule 12: Duplicate Breadcrumbs
+                if norm:
+                    if norm in breadcrumb_seen:
+                        first_cell = breadcrumb_seen[norm]
+                        issues.append(f"Duplicate breadcrumb (also in {first_cell})")
+                        summary["Duplicate breadcrumbs"] += 1
                     else:
-                        breadcrumb_seen[normalized_key] = cell_address
+                        breadcrumb_seen[norm] = cell_address
 
-                # 5) Breadcrumb ends with >
-                if display_value.endswith(">"):
-                    errors.append((cell_address, "Breadcrumb ends with '>'"))
+                # Rule 11: Ends with '>'
+                if norm.endswith(">"):
+                    issues.append("Breadcrumb ends with '>'")
+                    summary["Breadcrumb ends with >"] += 1
 
-    return errors, breadcrumb_col_name
+                if issues:
+                    errors.append({"cell": cell_address, "value": text, "issues": issues})
+
+                continue  # Skip remaining rules for Breadcrumbs
+
+            # ------------------ Non-Breadcrumb columns (Rules 1–10) ------------------
+
+            # Rule 1: Trailing spaces
+            if text != text.rstrip(" "):
+                issues.append("Trailing spaces found")
+                summary["Trailing spaces"] += 1
+
+            # Rule 2: Extra spaces between words
+            if "  " in text:
+                issues.append("Double spaces detected")
+                summary["Double spaces"] += 1
+
+            # Rule 3: Colon check
+            if ":" in text:
+                issues.append("Contains colon ':'")
+                summary["Colons"] += 1
+
+            # Rule 4: Space after '('
+            if "( " in text:
+                issues.append("Space after '('")
+                summary["Spaces after ("] += 1
+
+            # Rule 5: Space before ')'
+            if " )" in text:
+                issues.append("Space before ')'")
+                summary["Spaces before )"] += 1
+
+            # Rule 6: Spaces around hyphens
+            if " -" in text or "- " in text:
+                issues.append("Space around '-'")
+                summary["Spaces around -"] += 1
+
+            # Rule 7: Unbalanced brackets
+            if text.count("(") != text.count(")"):
+                issues.append("Unbalanced brackets")
+                summary["Unbalanced brackets"] += 1
+
+            # Rule 8: Full stop (only if ends with '.')
+            if has_full_stop_issue(text):
+                issues.append("Ends with full stop")
+                summary["Full stop issues"] += 1
+
+            # Rule 9: Title case
+            if is_title_case_issue(text):
+                issues.append("Title case detected")
+                summary["Title case issues"] += 1
+
+            # Rule 10: Accents / non-ASCII
+            has_accent = any(ord(ch) > 127 for ch in text)
+            if has_accent:
+                issues.append("Contains accented or non-ASCII characters")
+                summary["Accents / non-ASCII"] += 1
+
+            # Store row issues
+            if issues:
+                errors.append({"cell": cell_address, "value": text, "issues": issues})
+
+    return errors, summary
 
 
-# ---------- Routes ----------
+# ----------------- Flask Routes -----------------
 @app.route("/", methods=["GET", "POST"])
 def index():
-    errors = None
-    breadcrumb_col_name = None
-    file_name = None
-
-    # Clear previous error report by default
-    session["error_report"] = None
+    errors = []
+    summary = None
+    message = None
+    filename = None
+    had_run = False
 
     if request.method == "POST":
-        uploaded_file = request.files.get("file")
+        had_run = True
+        uploaded = request.files.get("file")
 
-        if uploaded_file and uploaded_file.filename:
-            file_name = uploaded_file.filename
-
+        if not uploaded or uploaded.filename.strip() == "":
+            message = "Please upload an Excel file."
+        else:
+            filename = uploaded.filename
             try:
-                df = pd.read_excel(uploaded_file, dtype=str)
-                errors, breadcrumb_col_name = validate_dataframe(df)
+                file_bytes = uploaded.read()
+                excel_io = BytesIO(file_bytes)
 
-                # Store error data in session for export as Excel
-                if errors:
-                    error_rows = [
-                        {"Cell": cell, "Issue": msg} for (cell, msg) in errors
-                    ]
-                    session["error_report"] = error_rows
+                xls = pd.ExcelFile(excel_io)
+                sheet_names = [s.strip() for s in xls.sheet_names]
+
+                if "Audit" not in sheet_names:
+                    message = "Audit sheet not found in the file"
                 else:
-                    session["error_report"] = None
+                    excel_io.seek(0)
+                    df = pd.read_excel(excel_io, sheet_name="Audit", dtype=str)
+
+                    errors, summary = validate_audit_sheet(df)
+                    app.config["LAST_ERRORS"] = errors
+                    app.config["LAST_FILENAME"] = filename
+
+                    if not errors:
+                        message = "No issues found."
 
             except Exception as e:
-                errors = [("N/A", f"Error reading file: {e}")]
-                session["error_report"] = None
+                message = f"Error reading file: {e}"
 
     return render_template(
         "index.html",
         errors=errors,
-        breadcrumb_col_name=breadcrumb_col_name,
-        file_name=file_name,
+        summary=summary,
+        message=message,
+        filename=filename,
+        had_run=had_run,
     )
 
 
-@app.route("/download-report")
-def download_report():
-    data = session.get("error_report")
+@app.route("/download")
+def download():
+    errors = app.config.get("LAST_ERRORS") or []
 
-    if not data:
-        # No report available – just go back to main page
-        return redirect(url_for("index"))
-
-    # Create DataFrame from stored errors
-    df_errors = pd.DataFrame(data)
-
-    # Write to in-memory Excel file
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_errors.to_excel(writer, index=False, sheet_name="Errors")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Errors"
+
+    ws.append(["Cell", "Cell Value", "Issues Found"])
+
+    if errors:
+        for e in errors:
+            ws.append([e["cell"], e["value"], "; ".join(e["issues"])])
+    else:
+        ws.append(["N/A", "N/A", "No issues found"])
+
+    wb.save(output)
     output.seek(0)
 
     return send_file(
         output,
         as_attachment=True,
-        download_name="error_report.xlsx",
-        mimetype=(
-            "application/vnd.openxmlformats-"
-            "officedocument.spreadsheetml.sheet"
-        ),
+        download_name="audit-errors.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
